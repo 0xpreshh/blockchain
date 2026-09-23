@@ -2,9 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger},
     token::{StellarAssetClient, TokenClient},
-    Env, String,
+    Bytes, Env, String, Vec,
 };
 
 fn setup<'a>() -> (
@@ -41,6 +41,9 @@ fn make_event(env: &Env, client: &TicketingContractClient, organizer: &Address, 
         &String::from_str(env, "concert"),
         &12_000u32, // max 120% of face value on resale
         &500u32,    // 5% organizer royalty
+        &10_000u64,
+        &100u64,
+        &200u64,
     );
 }
 
@@ -356,6 +359,9 @@ fn create_event_rejects_a_duplicate_event_id() {
         &String::from_str(&env, "concert"),
         &12_000u32,
         &500u32,
+        &10_000u64,
+        &100u64,
+        &200u64,
     );
     assert_eq!(result, Err(Ok(Error::EventAlreadyExists)));
 }
@@ -415,6 +421,9 @@ fn create_event_rejects_a_royalty_above_10_000_bps() {
         &String::from_str(&env, "concert"),
         &12_000u32,
         &10_001u32,
+        &10_000u64,
+        &100u64,
+        &200u64,
     );
     assert_eq!(result, Err(Ok(Error::InvalidRoyalty)));
 }
@@ -565,6 +574,9 @@ fn buy_resale_with_zero_royalty_pays_the_seller_in_full() {
         &String::from_str(&env, "corporate_events"),
         &15_000u32,
         &0u32, // no royalty
+        &10_000u64,
+        &100u64,
+        &200u64,
     );
     let seller = Address::generate(&env);
     let buyer = Address::generate(&env);
@@ -596,6 +608,9 @@ fn resale_price_exactly_at_the_face_value_cap_is_allowed() {
         &String::from_str(&env, "universities"),
         &10_000u32, // no markup allowed at all
         &0u32,
+        &10_000u64,
+        &100u64,
+        &200u64,
     );
     let owner = Address::generate(&env);
     let ticket_id = client.issue_ticket(
@@ -656,4 +671,214 @@ fn purchase_primary_allows_a_free_event() {
     let ticket = client.verify_ticket(&ticket_id);
     assert_eq!(ticket.owner, buyer);
     assert_eq!(ticket.original_price, 0);
+}
+
+
+#[test]
+fn lottery_allocates_requested_number_of_tickets() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let entrant_a = Address::generate(&env);
+    let entrant_b = Address::generate(&env);
+    let entrant_c = Address::generate(&env);
+    let mut entrants = Vec::new(&env);
+    entrants.push_back(entrant_a.clone());
+    entrants.push_back(entrant_b.clone());
+    entrants.push_back(entrant_c.clone());
+
+    let ticket_ids = client.allocate_lottery(
+        &organizer,
+        &1,
+        &entrants,
+        &2u32,
+        &String::from_str(&env, "Lottery"),
+        &0i128,
+    );
+
+    assert_eq!(ticket_ids.len(), 2);
+    let first_owner = client.verify_ticket(&ticket_ids.get(0).unwrap()).owner;
+    let second_owner = client.verify_ticket(&ticket_ids.get(1).unwrap()).owner;
+    assert_ne!(first_owner, second_owner);
+    assert!(
+        first_owner == entrant_a || first_owner == entrant_b || first_owner == entrant_c
+    );
+    assert!(
+        second_owner == entrant_a || second_owner == entrant_b || second_owner == entrant_c
+    );
+    assert_eq!(client.get_event(&1).tickets_issued, 2);
+}
+
+#[test]
+fn lottery_rejects_more_winners_than_entrants() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let mut entrants = Vec::new(&env);
+    entrants.push_back(Address::generate(&env));
+
+    let result = client.try_allocate_lottery(
+        &organizer,
+        &1,
+        &entrants,
+        &2u32,
+        &String::from_str(&env, "Lottery"),
+        &0i128,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidLottery)));
+}
+
+#[test]
+fn gift_claim_transfers_ticket_with_correct_secret() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let owner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &owner,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    let secret = Bytes::from_slice(&env, b"claim-me");
+    let secret_hash = env.crypto().sha256(&secret).to_bytes();
+    client.create_gift_claim(&owner, &ticket_id, &secret_hash, &500u64);
+    client.claim_gift(&recipient, &ticket_id, &secret);
+
+    assert_eq!(client.verify_ticket(&ticket_id).owner, recipient);
+    assert_eq!(
+        client.try_claim_gift(&owner, &ticket_id, &secret),
+        Err(Ok(Error::GiftClaimNotFound))
+    );
+}
+
+#[test]
+fn gift_claim_rejects_wrong_secret_and_expired_claim() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let owner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &owner,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    let secret = Bytes::from_slice(&env, b"claim-me");
+    let wrong_secret = Bytes::from_slice(&env, b"wrong");
+    let secret_hash = env.crypto().sha256(&secret).to_bytes();
+    client.create_gift_claim(&owner, &ticket_id, &secret_hash, &500u64);
+
+    assert_eq!(
+        client.try_claim_gift(&recipient, &ticket_id, &wrong_secret),
+        Err(Ok(Error::InvalidSecret))
+    );
+
+    env.ledger().set_timestamp(500);
+    assert_eq!(
+        client.try_claim_gift(&recipient, &ticket_id, &secret),
+        Err(Ok(Error::GiftClaimExpired))
+    );
+}
+
+#[test]
+fn direct_transfer_freezes_at_configured_window() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    client.create_event(
+        &organizer,
+        &1,
+        &String::from_str(&env, "Timed Event"),
+        &String::from_str(&env, "concert"),
+        &12_000u32,
+        &500u32,
+        &1_000u64,
+        &100u64,
+        &200u64,
+    );
+
+    let owner = Address::generate(&env);
+    let friend = Address::generate(&env);
+    let ticket_before = client.issue_ticket(
+        &organizer,
+        &1,
+        &owner,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &1_000i128,
+    );
+    let ticket_frozen = client.issue_ticket(
+        &organizer,
+        &1,
+        &owner,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A2"),
+        &1_000i128,
+    );
+
+    env.ledger().set_timestamp(899);
+    client.transfer_ticket(&owner, &ticket_before, &friend);
+
+    env.ledger().set_timestamp(900);
+    assert_eq!(
+        client.try_transfer_ticket(&owner, &ticket_frozen, &friend),
+        Err(Ok(Error::TransfersFrozen))
+    );
+}
+
+#[test]
+fn resale_listing_and_purchase_close_at_cutoff() {
+    let (env, client, _token, token_asset, _admin, organizer) = setup();
+    client.create_event(
+        &organizer,
+        &1,
+        &String::from_str(&env, "Timed Event"),
+        &String::from_str(&env, "concert"),
+        &12_000u32,
+        &500u32,
+        &1_000u64,
+        &100u64,
+        &200u64,
+    );
+
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &10_000i128);
+
+    let listed_ticket = client.issue_ticket(
+        &organizer,
+        &1,
+        &seller,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &1_000i128,
+    );
+    let late_ticket = client.issue_ticket(
+        &organizer,
+        &1,
+        &seller,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A2"),
+        &1_000i128,
+    );
+
+    env.ledger().set_timestamp(799);
+    client.list_for_resale(&seller, &listed_ticket, &1_100i128);
+
+    env.ledger().set_timestamp(800);
+    assert_eq!(
+        client.try_list_for_resale(&seller, &late_ticket, &1_100i128),
+        Err(Ok(Error::ResaleClosed))
+    );
+    assert_eq!(
+        client.try_buy_resale(&buyer, &listed_ticket),
+        Err(Ok(Error::ResaleClosed))
+    );
 }
