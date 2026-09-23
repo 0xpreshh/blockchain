@@ -44,6 +44,15 @@ pub struct Event {
     /// Basis points of every resale price paid to the organizer as royalty.
     pub royalty_bps: u32,
     pub tickets_issued: u64,
+    /// When true, primary sale proceeds are held by the contract instead of
+    /// paid to the organizer immediately, and can only be released once the
+    /// ledger sequence reaches `escrow_release_ledger`.
+    pub escrow_enabled: bool,
+    /// Ledger sequence after which escrowed proceeds may be released.
+    /// Ignored when `escrow_enabled` is false.
+    pub escrow_release_ledger: u32,
+    /// Primary sale proceeds currently held in escrow for this event.
+    pub escrow_balance: i128,
 }
 
 #[contracttype]
@@ -66,6 +75,8 @@ pub enum DataKey {
     Event(u64),
     Ticket(u64),
     NextTicketId,
+    LastPurchaseLedger(Address),
+    MinPurchaseSpacing,
 }
 
 #[contracterror]
@@ -85,6 +96,11 @@ pub enum Error {
     ResalePriceExceedsCap = 11,
     InvalidPrice = 12,
     InvalidRoyalty = 13,
+    EscrowNotEnabled = 14,
+    EventNotEnded = 15,
+    PurchaseTooSoon = 16,
+    NotAdmin = 17,
+    EventAlreadyStarted = 18,
 }
 
 const LEDGER_BUMP: u32 = 535_679; // ~31 days at 5s/ledger, matches other Soroban tooling defaults
@@ -140,11 +156,42 @@ impl TicketingContract {
             max_resale_multiplier_bps,
             royalty_bps,
             tickets_issued: 0,
+            escrow_enabled: false,
+            escrow_release_ledger: 0,
+            escrow_balance: 0,
         };
         env.storage().persistent().set(&key, &event);
         env.storage()
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(())
+    }
+
+    /// Opts an event into escrow: primary sale proceeds are held by the
+    /// contract instead of paid to the organizer immediately, and can only
+    /// be released via `release_escrow` once the ledger sequence reaches
+    /// `escrow_release_ledger` (e.g. the event's end). Must be called
+    /// before any tickets are sold, since it would otherwise change the
+    /// settlement terms for purchases already made.
+    pub fn enable_escrow(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        escrow_release_ledger: u32,
+    ) -> Result<(), Error> {
+        organizer.require_auth();
+        let mut event = Self::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(Error::NotOrganizer);
+        }
+        if event.tickets_issued > 0 {
+            return Err(Error::EventAlreadyStarted);
+        }
+        event.escrow_enabled = true;
+        event.escrow_release_ledger = escrow_release_ledger;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Event(event_id), &event);
         Ok(())
     }
 
@@ -189,17 +236,74 @@ impl TicketingContract {
         if price < 0 {
             return Err(Error::InvalidPrice);
         }
+        Self::enforce_purchase_throttle(&env, &buyer)?;
         let mut event = Self::get_event(&env, event_id)?;
         let token_client = token::Client::new(&env, &Self::payment_token(&env)?);
         if price > 0 {
-            token_client.transfer(&buyer, &event.organizer, &price);
+            if event.escrow_enabled {
+                token_client.transfer(&buyer, env.current_contract_address(), &price);
+                event.escrow_balance += price;
+            } else {
+                token_client.transfer(&buyer, &event.organizer, &price);
+            }
         }
-        let ticket_id = Self::mint(&env, event_id, buyer, tier, seat, price);
+        let ticket_id = Self::mint(&env, event_id, buyer.clone(), tier, seat, price);
         event.tickets_issued += 1;
         env.storage()
             .persistent()
             .set(&DataKey::Event(event_id), &event);
+        Self::record_purchase(&env, &buyer);
         Ok(ticket_id)
+    }
+
+    /// Releases an event's escrowed primary sale proceeds to the organizer.
+    /// Only callable by the organizer, and only once the current ledger
+    /// sequence has reached `escrow_release_ledger` (i.e. the event has
+    /// ended).
+    pub fn release_escrow(env: Env, organizer: Address, event_id: u64) -> Result<(), Error> {
+        organizer.require_auth();
+        let mut event = Self::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(Error::NotOrganizer);
+        }
+        if !event.escrow_enabled {
+            return Err(Error::EscrowNotEnabled);
+        }
+        if env.ledger().sequence() < event.escrow_release_ledger {
+            return Err(Error::EventNotEnded);
+        }
+        let amount = event.escrow_balance;
+        event.escrow_balance = 0;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Event(event_id), &event);
+        if amount > 0 {
+            let token_client = token::Client::new(&env, &Self::payment_token(&env)?);
+            token_client.transfer(&env.current_contract_address(), &organizer, &amount);
+        }
+        Ok(())
+    }
+
+    /// Admin-configurable minimum number of ledgers a buyer must wait
+    /// between primary purchases. Set to 0 to disable the throttle.
+    pub fn set_purchase_throttle(
+        env: Env,
+        admin: Address,
+        min_ledger_spacing: u32,
+    ) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if stored_admin != admin {
+            return Err(Error::NotAdmin);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MinPurchaseSpacing, &min_ledger_spacing);
+        Ok(())
     }
 
     /// Direct, non-marketplace transfer (gift, family member, etc).
@@ -364,6 +468,34 @@ impl TicketingContract {
     fn save_ticket(env: &Env, ticket_id: u64, ticket: &Ticket) {
         let key = DataKey::Ticket(ticket_id);
         env.storage().persistent().set(&key, ticket);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+
+    fn enforce_purchase_throttle(env: &Env, buyer: &Address) -> Result<(), Error> {
+        let spacing: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinPurchaseSpacing)
+            .unwrap_or(0);
+        if spacing == 0 {
+            return Ok(());
+        }
+        let key = DataKey::LastPurchaseLedger(buyer.clone());
+        if let Some(last_ledger) = env.storage().persistent().get::<_, u32>(&key) {
+            let current = env.ledger().sequence();
+            if current.saturating_sub(last_ledger) < spacing {
+                return Err(Error::PurchaseTooSoon);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_purchase(env: &Env, buyer: &Address) {
+        let key = DataKey::LastPurchaseLedger(buyer.clone());
+        let current = env.ledger().sequence();
+        env.storage().persistent().set(&key, &current);
         env.storage()
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);

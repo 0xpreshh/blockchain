@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
     Env, String,
 };
@@ -656,4 +656,181 @@ fn purchase_primary_allows_a_free_event() {
     let ticket = client.verify_ticket(&ticket_id);
     assert_eq!(ticket.owner, buyer);
     assert_eq!(ticket.original_price, 0);
+}
+
+#[test]
+fn escrowed_primary_sale_holds_funds_in_the_contract() {
+    let (env, client, token, token_asset, _admin, organizer) = setup();
+    client.create_event(
+        &organizer,
+        &1,
+        &String::from_str(&env, "Escrowed Show"),
+        &String::from_str(&env, "concert"),
+        &12_000u32,
+        &500u32,
+    );
+    client.enable_escrow(&organizer, &1, &1_000u32);
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    assert_eq!(token.balance(&organizer), 0);
+    assert_eq!(token.balance(&client.address), 1_000);
+    assert_eq!(client.get_event(&1).escrow_balance, 1_000);
+}
+
+#[test]
+fn release_escrow_rejects_before_the_event_ends() {
+    let (env, client, _token, token_asset, _admin, organizer) = setup();
+    client.create_event(
+        &organizer,
+        &1,
+        &String::from_str(&env, "Escrowed Show"),
+        &String::from_str(&env, "concert"),
+        &12_000u32,
+        &500u32,
+    );
+    client.enable_escrow(&organizer, &1, &1_000u32);
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    let result = client.try_release_escrow(&organizer, &1);
+    assert_eq!(result, Err(Ok(Error::EventNotEnded)));
+}
+
+#[test]
+fn release_escrow_pays_the_organizer_after_the_event_ends() {
+    let (env, client, token, token_asset, _admin, organizer) = setup();
+    client.create_event(
+        &organizer,
+        &1,
+        &String::from_str(&env, "Escrowed Show"),
+        &String::from_str(&env, "concert"),
+        &12_000u32,
+        &500u32,
+    );
+    client.enable_escrow(&organizer, &1, &1_000u32);
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number = 1_000);
+    client.release_escrow(&organizer, &1);
+
+    assert_eq!(token.balance(&organizer), 1_000);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(client.get_event(&1).escrow_balance, 0);
+
+    // A second release with nothing left in escrow is a no-op, not an error.
+    client.release_escrow(&organizer, &1);
+    assert_eq!(token.balance(&organizer), 1_000);
+}
+
+#[test]
+fn release_escrow_rejects_a_non_escrow_event() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let result = client.try_release_escrow(&organizer, &1);
+    assert_eq!(result, Err(Ok(Error::EscrowNotEnabled)));
+}
+
+#[test]
+fn enable_escrow_rejects_once_tickets_have_been_sold() {
+    let (env, client, _token, token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    let result = client.try_enable_escrow(&organizer, &1, &1_000u32);
+    assert_eq!(result, Err(Ok(Error::EventAlreadyStarted)));
+}
+
+#[test]
+fn purchase_throttle_rejects_rapid_repeat_purchases() {
+    let (env, client, _token, token_asset, admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    client.set_purchase_throttle(&admin, &10u32);
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &0i128,
+    );
+
+    let result = client.try_purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &0i128,
+    );
+    assert_eq!(result, Err(Ok(Error::PurchaseTooSoon)));
+}
+
+#[test]
+fn purchase_throttle_allows_purchase_after_spacing_elapses() {
+    let (env, client, _token, token_asset, admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    client.set_purchase_throttle(&admin, &10u32);
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &0i128,
+    );
+
+    env.ledger().with_mut(|l| l.sequence_number += 10);
+
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &0i128,
+    );
+    assert_eq!(client.verify_ticket(&ticket_id).owner, buyer);
+}
+
+#[test]
+fn set_purchase_throttle_rejects_a_non_admin_caller() {
+    let (env, client, _token, _token_asset, _admin, _organizer) = setup();
+    let not_admin = Address::generate(&env);
+    let result = client.try_set_purchase_throttle(&not_admin, &10u32);
+    assert_eq!(result, Err(Ok(Error::NotAdmin)));
 }
