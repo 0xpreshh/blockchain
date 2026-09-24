@@ -1151,3 +1151,321 @@ fn set_purchase_throttle_rejects_a_non_admin_caller() {
     let result = client.try_set_purchase_throttle(&not_admin, &10u32);
     assert_eq!(result, Err(Ok(Error::NotAdmin)));
 }
+
+#[test]
+fn verify_tickets_returns_all_tickets() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let t2 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "VIP"),
+        &String::from_str(&env, "B1"),
+        &10_000i128,
+    );
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+    ids.push_back(t2);
+
+    let tickets = client.verify_tickets(&ids);
+    assert_eq!(tickets.len(), 2);
+    assert_eq!(tickets.get(0).unwrap().owner, buyer);
+    assert_eq!(tickets.get(1).unwrap().owner, buyer);
+    assert_eq!(tickets.get(0).unwrap().status, TicketStatus::Valid);
+    assert_eq!(tickets.get(1).unwrap().status, TicketStatus::Valid);
+}
+
+#[test]
+fn verify_tickets_rejects_empty_and_oversized_batches() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let empty = Vec::new(&env);
+    let res_empty = client.try_verify_tickets(&empty);
+    assert_eq!(res_empty, Err(Ok(Error::EmptyBatch)));
+
+    let mut too_large = Vec::new(&env);
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        too_large.push_back(i as u64);
+    }
+    let res_large = client.try_verify_tickets(&too_large);
+    assert_eq!(res_large, Err(Ok(Error::BatchTooLarge)));
+}
+
+#[test]
+fn verify_tickets_rejects_nonexistent_ticket() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+    ids.push_back(999u64);
+
+    let res = client.try_verify_tickets(&ids);
+    assert_eq!(res, Err(Ok(Error::TicketNotFound)));
+}
+
+#[test]
+fn check_in_batch_marks_all_used_and_rejects_reentry() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let t2 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "VIP"),
+        &String::from_str(&env, "B1"),
+        &10_000i128,
+    );
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+    ids.push_back(t2);
+
+    client.check_in_batch(&organizer, &ids);
+    assert_eq!(client.verify_ticket(&t1).status, TicketStatus::Used);
+    assert_eq!(client.verify_ticket(&t2).status, TicketStatus::Used);
+
+    let res = client.try_check_in_batch(&organizer, &ids);
+    assert_eq!(res, Err(Ok(Error::AlreadyUsed)));
+}
+
+#[test]
+fn check_in_batch_validates_bounds_and_organizer() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let wrong_organizer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+
+    let empty = Vec::new(&env);
+    assert_eq!(
+        client.try_check_in_batch(&organizer, &empty),
+        Err(Ok(Error::EmptyBatch))
+    );
+
+    let mut too_large = Vec::new(&env);
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        too_large.push_back(i as u64);
+    }
+    assert_eq!(
+        client.try_check_in_batch(&organizer, &too_large),
+        Err(Ok(Error::BatchTooLarge))
+    );
+
+    assert_eq!(
+        client.try_check_in_batch(&wrong_organizer, &ids),
+        Err(Ok(Error::NotOrganizer))
+    );
+}
+
+#[test]
+fn revoke_batch_marks_all_revoked() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let t2 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "VIP"),
+        &String::from_str(&env, "B1"),
+        &10_000i128,
+    );
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+    ids.push_back(t2);
+
+    client.revoke_batch(&organizer, &ids);
+    assert_eq!(client.verify_ticket(&t1).status, TicketStatus::Revoked);
+    assert_eq!(client.verify_ticket(&t2).status, TicketStatus::Revoked);
+
+    assert_eq!(
+        client.try_check_in(&organizer, &t1),
+        Err(Ok(Error::Revoked))
+    );
+}
+
+#[test]
+fn revoke_batch_validates_bounds_and_organizer() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let wrong_organizer = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+
+    let empty = Vec::new(&env);
+    assert_eq!(
+        client.try_revoke_batch(&organizer, &empty),
+        Err(Ok(Error::EmptyBatch))
+    );
+
+    let mut too_large = Vec::new(&env);
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        too_large.push_back(i as u64);
+    }
+    assert_eq!(
+        client.try_revoke_batch(&organizer, &too_large),
+        Err(Ok(Error::BatchTooLarge))
+    );
+
+    assert_eq!(
+        client.try_revoke_batch(&wrong_organizer, &ids),
+        Err(Ok(Error::NotOrganizer))
+    );
+}
+
+#[test]
+fn transfer_batch_moves_ownership() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer1 = Address::generate(&env);
+    let buyer2 = Address::generate(&env);
+
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let t2 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer1,
+        &String::from_str(&env, "VIP"),
+        &String::from_str(&env, "B1"),
+        &10_000i128,
+    );
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+    ids.push_back(t2);
+
+    client.transfer_batch(&buyer1, &ids, &buyer2);
+    assert_eq!(client.verify_ticket(&t1).owner, buyer2);
+    assert_eq!(client.verify_ticket(&t2).owner, buyer2);
+    assert_eq!(client.verify_ticket(&t1).status, TicketStatus::Valid);
+    assert_eq!(client.verify_ticket(&t2).status, TicketStatus::Valid);
+}
+
+#[test]
+fn transfer_batch_validates_bounds_and_ownership() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer1 = Address::generate(&env);
+    let buyer2 = Address::generate(&env);
+    let non_owner = Address::generate(&env);
+
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+
+    let empty = Vec::new(&env);
+    assert_eq!(
+        client.try_transfer_batch(&buyer1, &empty, &buyer2),
+        Err(Ok(Error::EmptyBatch))
+    );
+
+    let mut too_large = Vec::new(&env);
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        too_large.push_back(i as u64);
+    }
+    assert_eq!(
+        client.try_transfer_batch(&buyer1, &too_large, &buyer2),
+        Err(Ok(Error::BatchTooLarge))
+    );
+
+    assert_eq!(
+        client.try_transfer_batch(&non_owner, &ids, &buyer2),
+        Err(Ok(Error::NotOwner))
+    );
+}
+
+#[test]
+fn transfer_batch_rejects_when_transfers_frozen() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer1 = Address::generate(&env);
+    let buyer2 = Address::generate(&env);
+
+    let t1 = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "A1"),
+        &5_000i128,
+    );
+    let mut ids = Vec::new(&env);
+    ids.push_back(t1);
+
+    // event starts_at = 10_000, freeze_seconds = 100 => frozen at timestamp >= 9_900
+    env.ledger().with_mut(|l| l.timestamp = 9_950);
+
+    let res = client.try_transfer_batch(&buyer1, &ids, &buyer2);
+    assert_eq!(res, Err(Ok(Error::TransfersFrozen)));
+}

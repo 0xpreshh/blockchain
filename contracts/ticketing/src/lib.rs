@@ -123,8 +123,11 @@ pub enum Error {
     GiftClaimExpired = 24,
     InvalidSecret = 25,
     InvalidExpiry = 26,
+    EmptyBatch = 27,
+    BatchTooLarge = 28,
 }
 
+pub const MAX_BATCH_SIZE: u32 = 50;
 const LEDGER_BUMP: u32 = 535_679; // ~31 days at 5s/ledger, matches other Soroban tooling defaults
 const LEDGER_THRESHOLD: u32 = 500_000;
 
@@ -416,6 +419,44 @@ impl TicketingContract {
         Ok(())
     }
 
+    /// Direct, non-marketplace batch transfer of tickets to a single recipient.
+    /// Bounded by `MAX_BATCH_SIZE`.
+    pub fn transfer_batch(
+        env: Env,
+        from: Address,
+        ticket_ids: Vec<u64>,
+        to: Address,
+    ) -> Result<(), Error> {
+        from.require_auth();
+        if ticket_ids.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
+        if ticket_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        for ticket_id in ticket_ids.iter() {
+            let mut ticket = Self::get_ticket(&env, ticket_id)?;
+            if ticket.owner != from {
+                return Err(Error::NotOwner);
+            }
+            match ticket.status {
+                TicketStatus::Used => return Err(Error::AlreadyUsed),
+                TicketStatus::Revoked => return Err(Error::Revoked),
+                _ => {}
+            }
+            let event = Self::get_event(&env, ticket.event_id)?;
+            if Self::transfer_frozen(&env, &event) {
+                return Err(Error::TransfersFrozen);
+            }
+            ticket.owner = to.clone();
+            ticket.status = TicketStatus::Valid;
+            ticket.resale_price = 0;
+            Self::remove_gift_claim(&env, ticket_id);
+            Self::save_ticket(&env, ticket_id, &ticket);
+        }
+        Ok(())
+    }
+
     /// Creates a claim link without requiring the recipient address up front.
     /// The owner shares the preimage off-chain; only its SHA-256 digest is stored.
     pub fn create_gift_claim(
@@ -510,6 +551,23 @@ impl TicketingContract {
         Self::get_ticket(&env, ticket_id)
     }
 
+    /// Read-only on-chain batch verification of tickets.
+    /// Allows scanners to inspect multiple tickets in one call.
+    /// Bounded by `MAX_BATCH_SIZE`.
+    pub fn verify_tickets(env: Env, ticket_ids: Vec<u64>) -> Result<Vec<Ticket>, Error> {
+        if ticket_ids.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
+        if ticket_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        let mut tickets = Vec::new(&env);
+        for ticket_id in ticket_ids.iter() {
+            tickets.push_back(Self::get_ticket(&env, ticket_id)?);
+        }
+        Ok(tickets)
+    }
+
     /// Marks a ticket as used at the point of entry. Only the event's
     /// organizer (or their delegated gate device, via a shared Soroban
     /// signer) may check a ticket in, and only once.
@@ -536,6 +594,39 @@ impl TicketingContract {
         Ok(())
     }
 
+    /// Marks a batch of tickets as used at the point of entry for group admission.
+    /// Only the event's organizer may check tickets in, bounded by `MAX_BATCH_SIZE`.
+    pub fn check_in_batch(env: Env, organizer: Address, ticket_ids: Vec<u64>) -> Result<(), Error> {
+        organizer.require_auth();
+        if ticket_ids.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
+        if ticket_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        for ticket_id in ticket_ids.iter() {
+            let mut ticket = Self::get_ticket(&env, ticket_id)?;
+            let event = Self::get_event(&env, ticket.event_id)?;
+            if event.organizer != organizer {
+                return Err(Error::NotOrganizer);
+            }
+            match ticket.status {
+                TicketStatus::Used => return Err(Error::AlreadyUsed),
+                TicketStatus::Revoked => return Err(Error::Revoked),
+                _ => {}
+            }
+            ticket.status = TicketStatus::Used;
+            Self::remove_gift_claim(&env, ticket_id);
+            Self::save_ticket(&env, ticket_id, &ticket);
+            TicketCheckedIn {
+                ticket_id,
+                organizer: organizer.clone(),
+            }
+            .publish(&env);
+        }
+        Ok(())
+    }
+
     /// Fraud prevention: organizer voids a ticket (chargeback, counterfeit
     /// report, policy violation). Revoked tickets can never be transferred,
     /// resold, or checked in again.
@@ -549,6 +640,29 @@ impl TicketingContract {
         ticket.status = TicketStatus::Revoked;
         Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
+        Ok(())
+    }
+
+    /// Mass revocation of tickets by the event organizer (chargeback, policy violation).
+    /// Bounded by `MAX_BATCH_SIZE`.
+    pub fn revoke_batch(env: Env, organizer: Address, ticket_ids: Vec<u64>) -> Result<(), Error> {
+        organizer.require_auth();
+        if ticket_ids.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
+        if ticket_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        for ticket_id in ticket_ids.iter() {
+            let mut ticket = Self::get_ticket(&env, ticket_id)?;
+            let event = Self::get_event(&env, ticket.event_id)?;
+            if event.organizer != organizer {
+                return Err(Error::NotOrganizer);
+            }
+            ticket.status = TicketStatus::Revoked;
+            Self::remove_gift_claim(&env, ticket_id);
+            Self::save_ticket(&env, ticket_id, &ticket);
+        }
         Ok(())
     }
 
