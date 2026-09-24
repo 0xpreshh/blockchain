@@ -445,7 +445,7 @@ impl TicketingContract {
     /// (issue #235).
     pub fn event_payment_token(env: Env, event_id: u64) -> Result<Address, Error> {
         let event = Self::get_event(&env, event_id)?;
-        Self::payment_token_for_event(&env, &event)
+        Self::payment_token_for_event(env, &event)
     }
 
     /// Organizer-authorized issuance for tickets already paid for off-chain
@@ -624,56 +624,6 @@ impl TicketingContract {
         Ok(())
     }
 
-    /// Upgrades a ticket to a higher tier by charging the difference in price.
-    /// The owner must pay the difference between new_price and the ticket's original_price.
-    /// The ticket status is reset to Valid after upgrade.
-    pub fn upgrade_ticket(
-        env: Env,
-        owner: Address,
-        ticket_id: u64,
-        new_tier: String,
-        new_price: i128,
-    ) -> Result<(), Error> {
-        owner.require_auth();
-        let mut ticket = Self::get_ticket(&env, ticket_id)?;
-        if ticket.owner != owner {
-            return Err(Error::NotOwner);
-        }
-        if new_price <= 0 {
-            return Err(Error::InvalidPrice);
-        }
-        if new_price < ticket.original_price {
-            return Err(Error::InvalidPrice);
-        }
-        match ticket.status {
-            TicketStatus::Used => return Err(Error::AlreadyUsed),
-            TicketStatus::Revoked => return Err(Error::Revoked),
-            _ => {}
-        }
-
-        let event = Self::get_event(&env, ticket.event_id)?;
-        let organizer = event.organizer.clone();
-
-        // Calculate the upgrade fee (difference between new and original price)
-        let upgrade_fee = new_price.saturating_sub(ticket.original_price);
-
-        if upgrade_fee > 0 {
-            // Transfer the upgrade fee from owner to organizer
-            let payment_token = Self::payment_token_for_event(&env, &event)?;
-            let token_client = token::Client::new(&env, &payment_token);
-            token_client.transfer(&owner, &organizer, &upgrade_fee);
-        }
-
-        // Update ticket with new tier and price
-        ticket.tier = new_tier;
-        ticket.original_price = new_price;
-        ticket.status = TicketStatus::Valid;
-        ticket.resale_price = 0;
-        Self::remove_gift_claim(&env, ticket_id);
-        Self::save_ticket(&env, ticket_id, &ticket);
-        Ok(())
-    }
-
     /// Creates a claim link without requiring the recipient address up front.
     /// The owner shares the preimage off-chain; only its SHA-256 digest is stored.
     pub fn create_gift_claim(
@@ -764,13 +714,6 @@ impl TicketingContract {
     /// Read-only on-chain verification — the core fraud-prevention primitive.
     /// Any scanner/app can call this without authentication to confirm a
     /// ticket's current owner and status before admitting entry.
-    /// Lightweight ownership check: returns the owner of a ticket without
-    /// full ticket details. Optimized for scanners and ownership verification.
-    pub fn owner_of(env: Env, ticket_id: u64) -> Result<Address, Error> {
-        let ticket = Self::get_ticket(&env, ticket_id)?;
-        Ok(ticket.owner)
-    }
-
     pub fn verify_ticket(env: Env, ticket_id: u64) -> Result<Ticket, Error> {
         Self::get_ticket(&env, ticket_id)
     }
@@ -789,50 +732,6 @@ impl TicketingContract {
         for ticket_id in ticket_ids.iter() {
             tickets.push_back(Self::get_ticket(&env, ticket_id)?);
         }
-        Ok(tickets)
-    }
-
-    /// Paginated ticket enumeration for an event. Returns up to `limit` tickets
-    /// starting from `start_index`. Enables bounded enumeration across all tickets.
-    /// `start_index` is 0-based; returns empty if start exceeds total tickets.
-    pub fn list_tickets(
-        env: Env,
-        event_id: u64,
-        start_index: u64,
-        limit: u32,
-    ) -> Result<Vec<Ticket>, Error> {
-        // Verify event exists
-        let _ = Self::get_event(&env, event_id)?;
-
-        if limit == 0 || limit > MAX_BATCH_SIZE {
-            return Err(Error::BatchTooLarge);
-        }
-
-        let mut tickets = Vec::new(&env);
-        let next_ticket_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextTicketId)
-            .unwrap_or(0);
-
-        let mut count = 0u32;
-        let mut current_index = 0u64;
-
-        for ticket_id in 0..next_ticket_id {
-            if let Ok(ticket) = Self::get_ticket(&env, ticket_id) {
-                if ticket.event_id == event_id {
-                    if current_index >= start_index && count < limit {
-                        tickets.push_back(ticket);
-                        count += 1;
-                    }
-                    current_index += 1;
-                    if count >= limit {
-                        break;
-                    }
-                }
-            }
-        }
-
         Ok(tickets)
     }
 
