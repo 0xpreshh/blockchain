@@ -1704,3 +1704,109 @@ fn native_xlm_resale_settles_atomically() {
     assert_eq!(ticket.owner, buyer);
     assert_eq!(ticket.status, TicketStatus::Valid);
 }
+
+// ── Per-event accepted payment token (issue #235) ───────────────────────────
+
+#[test]
+fn organizer_sets_a_per_event_payment_token_before_sales() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let other_admin = Address::generate(&env);
+    let other_token = env.register_stellar_asset_contract_v2(other_admin);
+
+    client.set_event_payment_token(&organizer, &1, &Some(other_token.address()));
+
+    // The event settles in its own token; the contract-wide one is untouched.
+    assert_eq!(
+        client.event_payment_token(&1),
+        other_token.address()
+    );
+}
+
+#[test]
+fn event_without_override_uses_the_contract_wide_token() {
+    let (env, client, token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // No per-event override: resolution falls back to the global token.
+    assert_eq!(client.event_payment_token(&1), token.address().unwrap());
+
+    // Clearing an unset override is a no-op.
+    client.set_event_payment_token(&organizer, &1, &None);
+    assert_eq!(client.event_payment_token(&1), token.address().unwrap());
+}
+
+#[test]
+fn event_with_override_settles_purchases_in_its_own_token() {
+    let (env, client, global_token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let other_admin = Address::generate(&env);
+    let event_token_contract = env.register_stellar_asset_contract_v2(other_admin);
+    let event_token = TokenClient::new(&env, &event_token_contract.address());
+    let token_asset = StellarAssetClient::new(&env, &event_token_contract.address());
+
+    client.set_event_payment_token(&organizer, &1, &Some(event_token_contract.address()));
+
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+    global_token.mint(&buyer, &5_000i128);
+
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    // Payment moved in the per-event token, not the contract-wide one.
+    assert_eq!(event_token.balance(&buyer), 3_000);
+    assert_eq!(global_token.balance(&buyer), 5_000);
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.owner, buyer);
+    assert_eq!(ticket.original_price, 2_000);
+}
+
+#[test]
+fn non_organizer_cannot_set_the_event_payment_token() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let impostor = Address::generate(&env);
+    let result = client.try_set_event_payment_token(&impostor, &1, &None);
+    assert_eq!(result, Err(Ok(Error::NotOrganizer)));
+}
+
+#[test]
+fn event_payment_token_cannot_change_after_tickets_are_issued() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    let other_admin = Address::generate(&env);
+    let other_token = env.register_stellar_asset_contract_v2(other_admin);
+
+    let result = client.try_set_event_payment_token(&organizer, &1, &Some(other_token.address()));
+    assert_eq!(result, Err(Ok(Error::TicketsAlreadyIssued)));
+}
+
+#[test]
+fn event_payment_token_rejects_a_non_token_address() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let not_a_token = Address::generate(&env);
+    let result = client.try_set_event_payment_token(&organizer, &1, &Some(not_a_token));
+    assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
+}

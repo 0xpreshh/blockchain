@@ -92,6 +92,11 @@ pub struct Event {
     pub escrow_release_ledger: u32,
     /// Primary sale proceeds currently held in escrow for this event.
     pub escrow_balance: i128,
+    /// Per-event accepted payment token (issue #235). `None` means the
+    /// event settles in the contract-wide payment token set at
+    /// initialization. Lockable only while no tickets have been issued so
+    /// existing sales stay denominated in the token they were paid in.
+    pub payment_token: Option<Address>,
 }
 
 #[contracttype]
@@ -318,6 +323,7 @@ impl TicketingContract {
             escrow_enabled: false,
             escrow_release_ledger: 0,
             escrow_balance: 0,
+            payment_token: None,
         };
         env.storage().persistent().set(&key, &event);
         env.storage()
@@ -404,6 +410,44 @@ impl TicketingContract {
         Ok(())
     }
 
+    /// Sets the event's accepted payment token (issue #235). When set, the
+    /// event's primary sales, resale settlement, escrow and refunds are all
+    /// denominated in this token instead of the contract-wide payment token.
+    /// Pass `None` to fall back to the contract-wide token. Only callable by
+    /// the organizer while no tickets have been issued — existing sales must
+    /// stay denominated in the token they were paid in.
+    pub fn set_event_payment_token(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        token: Option<Address>,
+    ) -> Result<(), Error> {
+        organizer.require_auth();
+        let mut event = Self::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(Error::NotOrganizer);
+        }
+        if event.tickets_issued > 0 {
+            return Err(Error::TicketsAlreadyIssued);
+        }
+        if let Some(token) = &token {
+            Self::ensure_token_contract(&env, token)?;
+        }
+        event.payment_token = token;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Event(event_id), &event);
+        Ok(())
+    }
+
+    /// Returns the event's accepted payment token: the per-event override
+    /// when one is set, otherwise the contract-wide payment token
+    /// (issue #235).
+    pub fn event_payment_token(env: Env, event_id: u64) -> Result<Address, Error> {
+        let event = Self::get_event(&env, event_id)?;
+        Self::payment_token_for_event(env, &event)
+    }
+
     /// Organizer-authorized issuance for tickets already paid for off-chain
     /// (card payment, comp, or fiat-to-crypto settled by the platform).
     pub fn issue_ticket(
@@ -447,7 +491,7 @@ impl TicketingContract {
         }
         Self::enforce_purchase_throttle(&env, &buyer)?;
         let mut event = Self::get_event(&env, event_id)?;
-        let token_client = token::Client::new(&env, &Self::payment_token(&env)?);
+        let token_client = token::Client::new(&env, &Self::payment_token_for_event(&env, &event)?);
         if price > 0 {
             if event.escrow_enabled {
                 token_client.transfer(&buyer, env.current_contract_address(), &price);
@@ -487,7 +531,8 @@ impl TicketingContract {
             .persistent()
             .set(&DataKey::Event(event_id), &event);
         if amount > 0 {
-            let token_client = token::Client::new(&env, &Self::payment_token(&env)?);
+            let token_client =
+                token::Client::new(&env, &Self::payment_token_for_event(&env, &event)?);
             token_client.transfer(&env.current_contract_address(), &organizer, &amount);
         }
         Ok(())
@@ -853,7 +898,7 @@ impl TicketingContract {
         if Self::resale_closed(&env, &event) {
             return Err(Error::ResaleClosed);
         }
-        let token_client = token::Client::new(&env, &Self::payment_token(&env)?);
+        let token_client = token::Client::new(&env, &Self::payment_token_for_event(&env, &event)?);
         let royalty = ticket.resale_price * event.royalty_bps as i128 / 10_000;
         let seller_amount = ticket.resale_price - royalty;
         if royalty > 0 {
@@ -975,6 +1020,15 @@ impl TicketingContract {
             .instance()
             .get(&DataKey::PaymentToken)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Resolves the payment token for an event: the per-event accepted token
+    /// when set, otherwise the contract-wide payment token (issue #235).
+    fn payment_token_for_event(env: &Env, event: &Event) -> Result<Address, Error> {
+        match &event.payment_token {
+            Some(token) => Ok(token.clone()),
+            None => Self::payment_token(env),
+        }
     }
 
     fn mint(env: &Env, event_id: u64, to: Address, tier: String, seat: String, price: i128) -> u64 {
