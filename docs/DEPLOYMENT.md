@@ -10,3 +10,16 @@
    production payment token and a hardware-backed admin key
 6. Record the deployed contract ID in the backend's
    `TICKETING_CONTRACT_ID` environment variable
+
+## Multisig admin
+
+On mainnet the contract admin should be a multisig account rather than a
+single key. Configure it before calling `initialize`:
+
+```
+scripts/setup-multisig-admin.sh <admin-identity> <network> <threshold> <signer-address>...
+```
+
+Run it on testnet first and confirm an admin call (for example
+`set_purchase_throttle`) needs `<threshold>` signatures before doing the same
+on mainnet.

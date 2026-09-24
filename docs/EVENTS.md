@@ -23,3 +23,12 @@ Emitted by `check_in`.
 
 Indexers and the backend's reconciliation job can subscribe to these
 instead of polling `get_ticket` for every ticket on every block.
+
+## Admin events
+
+| Event | Emitted by | Fields |
+|---|---|---|
+| `ContractInitialized` | `initialize` | `admin` (topic), `payment_token` |
+| `PurchaseThrottleUpdated` | `set_purchase_throttle` | `admin` (topic), `min_ledger_spacing` |
+| `PaymentTokenProposed` | `propose_payment_token` | `admin` (topic), `new_token`, `apply_after_ledger` |
+| `PaymentTokenChanged` | `apply_payment_token` | `admin` (topic), `old_token`, `new_token` |

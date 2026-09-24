@@ -16,6 +16,40 @@ pub struct TicketIssued {
 
 #[contractevent]
 #[derive(Clone, Debug)]
+pub struct ContractInitialized {
+    #[topic]
+    pub admin: Address,
+    pub payment_token: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PurchaseThrottleUpdated {
+    #[topic]
+    pub admin: Address,
+    pub min_ledger_spacing: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentTokenProposed {
+    #[topic]
+    pub admin: Address,
+    pub new_token: Address,
+    pub apply_after_ledger: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentTokenChanged {
+    #[topic]
+    pub admin: Address,
+    pub old_token: Address,
+    pub new_token: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
 pub struct TicketCheckedIn {
     #[topic]
     pub ticket_id: u64,
@@ -80,11 +114,20 @@ pub struct GiftClaim {
     pub expires_at: u64,
 }
 
+/// A payment token change that has been proposed but not yet applied.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPaymentToken {
+    pub token: Address,
+    pub apply_after_ledger: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
     PaymentToken,
+    PendingPaymentToken,
     Event(u64),
     Ticket(u64),
     GiftClaim(u64),
@@ -125,9 +168,15 @@ pub enum Error {
     InvalidExpiry = 26,
     EmptyBatch = 27,
     BatchTooLarge = 28,
+    InvalidPaymentToken = 29,
+    NoPendingPaymentToken = 30,
+    TimelockNotElapsed = 31,
 }
 
 pub const MAX_BATCH_SIZE: u32 = 50;
+/// Ledgers that must pass between proposing and applying a payment token
+/// change (~1 day at 5s/ledger).
+pub const PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS: u32 = 17_280;
 const LEDGER_BUMP: u32 = 535_679; // ~31 days at 5s/ledger, matches other Soroban tooling defaults
 const LEDGER_THRESHOLD: u32 = 500_000;
 
@@ -143,6 +192,7 @@ impl TicketingContract {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
+        Self::ensure_token_contract(&env, &payment_token)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -151,6 +201,68 @@ impl TicketingContract {
         env.storage()
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        ContractInitialized {
+            admin,
+            payment_token,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Step one of a payment token change: the admin proposes a new token,
+    /// which can only be applied after `PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS`.
+    /// A new proposal replaces any pending one. Proceeds already held in
+    /// escrow stay denominated in the old token, so release them first.
+    pub fn propose_payment_token(
+        env: Env,
+        admin: Address,
+        new_token: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::ensure_token_contract(&env, &new_token)?;
+        let apply_after_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS);
+        env.storage().instance().set(
+            &DataKey::PendingPaymentToken,
+            &PendingPaymentToken {
+                token: new_token.clone(),
+                apply_after_ledger,
+            },
+        );
+        PaymentTokenProposed {
+            admin,
+            new_token,
+            apply_after_ledger,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Step two: once the delay has elapsed, the admin applies the pending
+    /// payment token.
+    pub fn apply_payment_token(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let pending: PendingPaymentToken = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingPaymentToken)
+            .ok_or(Error::NoPendingPaymentToken)?;
+        if env.ledger().sequence() < pending.apply_after_ledger {
+            return Err(Error::TimelockNotElapsed);
+        }
+        let old_token = Self::payment_token(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentToken, &pending.token);
+        env.storage().instance().remove(&DataKey::PendingPaymentToken);
+        PaymentTokenChanged {
+            admin,
+            old_token,
+            new_token: pending.token,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -375,18 +487,15 @@ impl TicketingContract {
         admin: Address,
         min_ledger_spacing: u32,
     ) -> Result<(), Error> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if stored_admin != admin {
-            return Err(Error::NotAdmin);
-        }
-        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
             .set(&DataKey::MinPurchaseSpacing, &min_ledger_spacing);
+        PurchaseThrottleUpdated {
+            admin,
+            min_ledger_spacing,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -813,6 +922,28 @@ impl TicketingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if stored_admin != *admin {
+            return Err(Error::NotAdmin);
+        }
+        admin.require_auth();
+        Ok(())
+    }
+
+    /// Probes `token` with a `decimals()` call so an address that is not a
+    /// token contract is rejected up front.
+    fn ensure_token_contract(env: &Env, token: &Address) -> Result<(), Error> {
+        match token::Client::new(env, token).try_decimals() {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Error::InvalidPaymentToken),
+        }
     }
 
     fn payment_token(env: &Env) -> Result<Address, Error> {
