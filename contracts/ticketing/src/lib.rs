@@ -127,6 +127,7 @@ pub struct PendingPaymentToken {
 pub enum DataKey {
     Admin,
     PaymentToken,
+    TokenDecimals,
     PendingPaymentToken,
     Event(u64),
     Ticket(u64),
@@ -171,6 +172,7 @@ pub enum Error {
     InvalidPaymentToken = 29,
     NoPendingPaymentToken = 30,
     TimelockNotElapsed = 31,
+    TicketsAlreadyIssued = 32,
 }
 
 pub const MAX_BATCH_SIZE: u32 = 50;
@@ -192,11 +194,14 @@ impl TicketingContract {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
-        Self::ensure_token_contract(&env, &payment_token)?;
+        // The probe validates that `payment_token` is a real token contract
+        // and captures its decimals for client display (issue #233).
+        let decimals = Self::ensure_token_contract(&env, &payment_token)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&DataKey::PaymentToken, &payment_token);
+        env.storage().instance().set(&DataKey::TokenDecimals, &decimals);
         env.storage().instance().set(&DataKey::NextTicketId, &0u64);
         env.storage()
             .instance()
@@ -219,6 +224,10 @@ impl TicketingContract {
         new_token: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        // The probe validates that the proposed token is a real token
+        // contract. Its decimals are captured when the change is APPLIED so
+        // clients always see decimals matching the active payment token
+        // (issue #233).
         Self::ensure_token_contract(&env, &new_token)?;
         let apply_after_ledger = env
             .ledger()
@@ -253,9 +262,13 @@ impl TicketingContract {
             return Err(Error::TimelockNotElapsed);
         }
         let old_token = Self::payment_token(&env)?;
+        // Capture the decimals of the token becoming active so clients always
+        // see decimals matching the active payment token (issue #233).
+        let decimals = Self::ensure_token_contract(&env, &pending.token)?;
         env.storage()
             .instance()
             .set(&DataKey::PaymentToken, &pending.token);
+        env.storage().instance().set(&DataKey::TokenDecimals, &decimals);
         env.storage().instance().remove(&DataKey::PendingPaymentToken);
         PaymentTokenChanged {
             admin,
@@ -938,12 +951,23 @@ impl TicketingContract {
     }
 
     /// Probes `token` with a `decimals()` call so an address that is not a
-    /// token contract is rejected up front.
-    fn ensure_token_contract(env: &Env, token: &Address) -> Result<(), Error> {
+    /// token contract is rejected up front. Returns the token's decimals so
+    /// callers can cache them (issue #233).
+    fn ensure_token_contract(env: &Env, token: &Address) -> Result<u32, Error> {
         match token::Client::new(env, token).try_decimals() {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(decimals)) => Ok(decimals),
             _ => Err(Error::InvalidPaymentToken),
         }
+    }
+
+    /// Decimals of the active payment token, cached at initialization and
+    /// refreshed whenever the payment token changes. Frontends use this to
+    /// convert token amounts between raw units and display units.
+    pub fn token_decimals(env: Env) -> Result<u32, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenDecimals)
+            .ok_or(Error::NotInitialized)
     }
 
     fn payment_token(env: &Env) -> Result<Address, Error> {

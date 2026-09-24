@@ -1519,3 +1519,42 @@ fn proposing_a_non_token_payment_token_is_rejected() {
     let result = client.try_propose_payment_token(&admin, &not_a_token);
     assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
 }
+
+
+// ── Token decimals for client display (issue #233) ──────────────────────────
+
+#[test]
+fn token_decimals_are_cached_on_initialize() {
+    let (env, client, _token, _token_asset, _admin, _organizer) = setup();
+
+    // The Stellar Asset Contract wraps 7-decimal assets.
+    assert_eq!(client.token_decimals(), 7);
+}
+
+#[test]
+fn token_decimals_refresh_when_the_payment_token_changes() {
+    let (env, client, _token, _token_asset, admin, _organizer) = setup();
+
+    // A second token contract (another Stellar Asset Contract instance).
+    let second_admin = Address::generate(&env);
+    let second = env.register_stellar_asset_contract_v2(second_admin);
+
+    client.propose_payment_token(&admin, &second.address());
+
+    // Fast-forward past the payment-token timelock and apply the change.
+    env.ledger().with_mut(|li| li.sequence_number += PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS + 1);
+    client.apply_payment_token(&admin);
+
+    // The cached decimals are refreshed for the now-active token.
+    assert_eq!(client.token_decimals(), 7);
+}
+
+#[test]
+fn token_decimals_reject_an_invalid_token_on_propose() {
+    let (env, client, _token, _token_asset, admin, _organizer) = setup();
+
+    // An address that is not a token contract.
+    let not_a_token = Address::generate(&env);
+    let result = client.try_propose_payment_token(&admin, &not_a_token);
+    assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
+}
