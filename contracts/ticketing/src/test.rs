@@ -673,7 +673,6 @@ fn purchase_primary_allows_a_free_event() {
     assert_eq!(ticket.original_price, 0);
 }
 
-
 #[test]
 fn lottery_allocates_requested_number_of_tickets() {
     let (env, client, _token, _token_asset, _admin, organizer) = setup();
@@ -700,12 +699,8 @@ fn lottery_allocates_requested_number_of_tickets() {
     let first_owner = client.verify_ticket(&ticket_ids.get(0).unwrap()).owner;
     let second_owner = client.verify_ticket(&ticket_ids.get(1).unwrap()).owner;
     assert_ne!(first_owner, second_owner);
-    assert!(
-        first_owner == entrant_a || first_owner == entrant_b || first_owner == entrant_c
-    );
-    assert!(
-        second_owner == entrant_a || second_owner == entrant_b || second_owner == entrant_c
-    );
+    assert!(first_owner == entrant_a || first_owner == entrant_b || first_owner == entrant_c);
+    assert!(second_owner == entrant_a || second_owner == entrant_b || second_owner == entrant_c);
     assert_eq!(client.get_event(&1).tickets_issued, 2);
 }
 
@@ -726,6 +721,29 @@ fn lottery_rejects_more_winners_than_entrants() {
         &0i128,
     );
     assert_eq!(result, Err(Ok(Error::InvalidLottery)));
+}
+
+#[test]
+fn lottery_rejects_duplicate_entrants() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let entrant = Address::generate(&env);
+    let mut entrants = Vec::new(&env);
+    entrants.push_back(entrant.clone());
+    entrants.push_back(entrant);
+
+    let result = client.try_allocate_lottery(
+        &organizer,
+        &1,
+        &entrants,
+        &2u32,
+        &String::from_str(&env, "Lottery"),
+        &0i128,
+    );
+
+    assert_eq!(result, Err(Ok(Error::InvalidLottery)));
+    assert_eq!(client.get_event(&1).tickets_issued, 0);
 }
 
 #[test]
@@ -787,6 +805,72 @@ fn gift_claim_rejects_wrong_secret_and_expired_claim() {
         client.try_claim_gift(&recipient, &ticket_id, &secret),
         Err(Ok(Error::GiftClaimExpired))
     );
+}
+
+#[test]
+fn resale_listing_invalidates_an_existing_gift_claim() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let owner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &owner,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+    let secret = Bytes::from_slice(&env, b"claim-me");
+    let secret_hash = env.crypto().sha256(&secret).to_bytes();
+
+    client.create_gift_claim(&owner, &ticket_id, &secret_hash, &500u64);
+    client.list_for_resale(&owner, &ticket_id, &1_100i128);
+
+    assert_eq!(
+        client.try_claim_gift(&recipient, &ticket_id, &secret),
+        Err(Ok(Error::GiftClaimNotFound))
+    );
+    assert_eq!(
+        client.verify_ticket(&ticket_id).status,
+        TicketStatus::Resale
+    );
+}
+
+#[test]
+fn gift_claim_creation_cancels_an_existing_resale_listing() {
+    let (env, client, _token, token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let owner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &owner,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+    client.list_for_resale(&owner, &ticket_id, &1_100i128);
+    token_asset.mint(&buyer, &2_000i128);
+
+    let secret = Bytes::from_slice(&env, b"claim-me");
+    let secret_hash = env.crypto().sha256(&secret).to_bytes();
+    client.create_gift_claim(&owner, &ticket_id, &secret_hash, &500u64);
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.status, TicketStatus::Valid);
+    assert_eq!(ticket.resale_price, 0);
+    assert_eq!(
+        client.try_buy_resale(&buyer, &ticket_id),
+        Err(Ok(Error::NotForResale))
+    );
+
+    client.claim_gift(&recipient, &ticket_id, &secret);
+    assert_eq!(client.verify_ticket(&ticket_id).owner, recipient);
 }
 
 #[test]

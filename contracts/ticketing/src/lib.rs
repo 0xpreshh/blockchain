@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
@@ -194,6 +195,13 @@ impl TicketingContract {
         if price < 0 || winner_count == 0 || winner_count > entrants.len() {
             return Err(Error::InvalidLottery);
         }
+        for i in 0..entrants.len() {
+            for j in (i + 1)..entrants.len() {
+                if entrants.get(i) == entrants.get(j) {
+                    return Err(Error::InvalidLottery);
+                }
+            }
+        }
 
         let mut event = Self::get_event(&env, event_id)?;
         if event.organizer != organizer {
@@ -300,7 +308,7 @@ impl TicketingContract {
         ticket.owner = to;
         ticket.status = TicketStatus::Valid;
         ticket.resale_price = 0;
-        env.storage().persistent().remove(&DataKey::GiftClaim(ticket_id));
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -319,7 +327,7 @@ impl TicketingContract {
             return Err(Error::InvalidExpiry);
         }
 
-        let ticket = Self::get_ticket(&env, ticket_id)?;
+        let mut ticket = Self::get_ticket(&env, ticket_id)?;
         if ticket.owner != owner {
             return Err(Error::NotOwner);
         }
@@ -327,6 +335,11 @@ impl TicketingContract {
             TicketStatus::Used => return Err(Error::AlreadyUsed),
             TicketStatus::Revoked => return Err(Error::Revoked),
             _ => {}
+        }
+        if ticket.status == TicketStatus::Resale {
+            ticket.status = TicketStatus::Valid;
+            ticket.resale_price = 0;
+            Self::save_ticket(&env, ticket_id, &ticket);
         }
 
         let claim = GiftClaim {
@@ -410,6 +423,7 @@ impl TicketingContract {
             _ => {}
         }
         ticket.status = TicketStatus::Used;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         TicketCheckedIn {
             ticket_id,
@@ -430,6 +444,7 @@ impl TicketingContract {
             return Err(Error::NotOrganizer);
         }
         ticket.status = TicketStatus::Revoked;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -466,6 +481,7 @@ impl TicketingContract {
         }
         ticket.status = TicketStatus::Resale;
         ticket.resale_price = price;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -510,6 +526,7 @@ impl TicketingContract {
         ticket.owner = buyer;
         ticket.status = TicketStatus::Valid;
         ticket.resale_price = 0;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -536,6 +553,12 @@ impl TicketingContract {
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
     }
 
+    fn remove_gift_claim(env: &Env, ticket_id: u64) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GiftClaim(ticket_id));
+    }
+
     fn transfer_frozen(env: &Env, event: &Event) -> bool {
         env.ledger().timestamp()
             >= event
@@ -544,8 +567,7 @@ impl TicketingContract {
     }
 
     fn resale_closed(env: &Env, event: &Event) -> bool {
-        env.ledger().timestamp()
-            >= event.starts_at.saturating_sub(event.resale_cutoff_seconds)
+        env.ledger().timestamp() >= event.starts_at.saturating_sub(event.resale_cutoff_seconds)
     }
 
     fn payment_token(env: &Env) -> Result<Address, Error> {
