@@ -1519,3 +1519,429 @@ fn proposing_a_non_token_payment_token_is_rejected() {
     let result = client.try_propose_payment_token(&admin, &not_a_token);
     assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
 }
+
+
+// ── Token decimals for client display (issue #233) ──────────────────────────
+
+#[test]
+fn token_decimals_are_cached_on_initialize() {
+    let (env, client, _token, _token_asset, _admin, _organizer) = setup();
+
+    // The Stellar Asset Contract wraps 7-decimal assets.
+    assert_eq!(client.token_decimals(), 7);
+}
+
+#[test]
+fn token_decimals_refresh_when_the_payment_token_changes() {
+    let (env, client, _token, _token_asset, admin, _organizer) = setup();
+
+    // A second token contract (another Stellar Asset Contract instance).
+    let second_admin = Address::generate(&env);
+    let second = env.register_stellar_asset_contract_v2(second_admin);
+
+    client.propose_payment_token(&admin, &second.address());
+
+    // Fast-forward past the payment-token timelock and apply the change.
+    env.ledger().with_mut(|li| li.sequence_number += PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS + 1);
+    client.apply_payment_token(&admin);
+
+    // The cached decimals are refreshed for the now-active token.
+    assert_eq!(client.token_decimals(), 7);
+}
+
+#[test]
+fn token_decimals_reject_an_invalid_token_on_propose() {
+    let (env, client, _token, _token_asset, admin, _organizer) = setup();
+
+    // An address that is not a token contract.
+    let not_a_token = Address::generate(&env);
+    let result = client.try_propose_payment_token(&admin, &not_a_token);
+    assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
+}
+
+// ── Native XLM payments via the Stellar Asset Contract (issue #234) ─────────
+
+/// Registers the built-in Stellar Asset Contract for the NATIVE XLM asset in
+/// the test environment, mirroring how `Env::register_stellar_asset_contract_v2`
+/// deploys an asset-wrapped SAC, but with `Asset::Native` as the preimage.
+fn register_native_asset_contract(env: &Env) -> Address {
+    use std::rc::Rc;
+    let create = xdr::HostFunction::CreateContract(xdr::CreateContractArgs {
+        contract_id_preimage: xdr::ContractIdPreimage::Asset(xdr::Asset::Native),
+        executable: xdr::ContractExecutable::StellarAsset,
+    });
+    let token_id: Address = env
+        .host()
+        .invoke_function(create)
+        .unwrap()
+        .try_into_val(env)
+        .unwrap();
+    token_id
+}
+
+/// Creates an account ledger entry funded with `balance` lumens, so the
+/// native asset contract's transfers have a balance to draw from. Returns
+/// the SDK `Address` for the account.
+fn create_funded_xlm_account(env: &Env, key: [u8; 32], balance: i64) -> Address {
+    use std::rc::Rc;
+    let account_id = xdr::AccountId(xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key)));
+    let ledger_key = Rc::new(xdr::LedgerKey::Account(xdr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    }));
+    let ledger_entry = Rc::new(xdr::LedgerEntry {
+        data: xdr::LedgerEntryData::Account(xdr::AccountEntry {
+            account_id: account_id.clone(),
+            balance,
+            flags: 0,
+            home_domain: Default::default(),
+            inflation_dest: None,
+            num_sub_entries: 0,
+            seq_num: xdr::SequenceNumber(0),
+            thresholds: xdr::Thresholds([1; 4]),
+            signers: xdr::VecM::default(),
+            ext: xdr::AccountEntryExt::V0,
+        }),
+        last_modified_ledger_seq: 0,
+        ext: xdr::LedgerEntryExt::V0,
+    });
+    env.host().add_ledger_entry(&ledger_key, &ledger_entry, None).unwrap();
+    xdr::ScAddress::Account(account_id).try_into_val(env).unwrap()
+}
+
+#[test]
+fn native_xlm_sac_is_accepted_as_payment_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // The native XLM Stellar Asset Contract is deterministic per network.
+    let native_sac = register_native_asset_contract(&env);
+    let admin = Address::generate(&env);
+    let organizer = create_funded_xlm_account(&env, [1u8; 32], 1_000_000_000);
+
+    let contract_id = env.register(TicketingContract, ());
+    let client = TicketingContractClient::new(&env, &contract_id);
+    // Initialize probes the native SAC's decimals() — an address that is not
+    // a token contract would be rejected here.
+    client.initialize(&admin, &native_sac);
+
+    // Issue #233's getter reports the native asset's 7 decimals.
+    assert_eq!(client.token_decimals(), 7);
+}
+
+#[test]
+fn native_xlm_primary_sale_moves_xlm_and_mints_the_ticket() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let native_sac = register_native_asset_contract(&env);
+    let native_token = TokenClient::new(&env, &native_sac);
+
+    let admin = Address::generate(&env);
+    // Organizer and buyer as funded on-chain accounts holding real XLM.
+    let organizer = create_funded_xlm_account(&env, [1u8; 32], 1_000_000_000);
+    let buyer = create_funded_xlm_account(&env, [2u8; 32], 5_000_000_000);
+
+    let contract_id = env.register(TicketingContract, ());
+    let client = TicketingContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &native_sac);
+    make_event(&env, &client, &organizer, 1);
+
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000_000_000i128, // 200 XLM
+    );
+
+    // Payment moved through the native asset contract.
+    assert_eq!(native_token.balance(&organizer), 3_000_000_000); // 100 XLM initial + 200 XLM ticket
+    assert_eq!(native_token.balance(&buyer), 3_000_000_000); // 500 XLM initial - 200 XLM ticket
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.owner, buyer);
+    assert_eq!(ticket.status, TicketStatus::Valid);
+    assert_eq!(ticket.original_price, 2_000_000_000);
+}
+
+#[test]
+fn native_xlm_resale_settles_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let native_sac = register_native_asset_contract(&env);
+    let native_token = TokenClient::new(&env, &native_sac);
+
+    let admin = Address::generate(&env);
+    let organizer = create_funded_xlm_account(&env, [1u8; 32], 1_000_000_000);
+    let seller = create_funded_xlm_account(&env, [2u8; 32], 5_000_000_000);
+    let buyer = create_funded_xlm_account(&env, [3u8; 32], 5_000_000_000);
+
+    let contract_id = env.register(TicketingContract, ());
+    let client = TicketingContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &native_sac);
+    make_event(&env, &client, &organizer, 1);
+
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &seller,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000_000_000i128, // 200 XLM face value
+    );
+
+    // Resale at face value (cap is 120%); 5% royalty to the organizer.
+    client.list_for_resale(&seller, &ticket_id, &2_000_000_000i128);
+    client.buy_resale(&buyer, &ticket_id);
+
+    // Royalty 5% of 2 XLM = 0.1 XLM; seller receives 1.9 XLM.
+    assert_eq!(native_token.balance(&organizer), 1_000_100_000); // 100.1 XLM
+    assert_eq!(native_token.balance(&seller), 4_900_000_000); // 490 XLM
+    assert_eq!(native_token.balance(&buyer), 3_000_000_000); // 300 XLM
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.owner, buyer);
+    assert_eq!(ticket.status, TicketStatus::Valid);
+}
+
+// ── Per-event accepted payment token (issue #235) ───────────────────────────
+
+#[test]
+fn organizer_sets_a_per_event_payment_token_before_sales() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let other_admin = Address::generate(&env);
+    let other_token = env.register_stellar_asset_contract_v2(other_admin);
+
+    client.set_event_payment_token(&organizer, &1, &Some(other_token.address()));
+
+    // The event settles in its own token; the contract-wide one is untouched.
+    assert_eq!(
+        client.event_payment_token(&1),
+        other_token.address()
+    );
+}
+
+#[test]
+fn event_without_override_uses_the_contract_wide_token() {
+    let (env, client, token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // No per-event override: resolution falls back to the global token.
+    assert_eq!(client.event_payment_token(&1), token.address().unwrap());
+
+    // Clearing an unset override is a no-op.
+    client.set_event_payment_token(&organizer, &1, &None);
+    assert_eq!(client.event_payment_token(&1), token.address().unwrap());
+}
+
+#[test]
+fn event_with_override_settles_purchases_in_its_own_token() {
+    let (env, client, global_token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let other_admin = Address::generate(&env);
+    let event_token_contract = env.register_stellar_asset_contract_v2(other_admin);
+    let event_token = TokenClient::new(&env, &event_token_contract.address());
+    let token_asset = StellarAssetClient::new(&env, &event_token_contract.address());
+
+    client.set_event_payment_token(&organizer, &1, &Some(event_token_contract.address()));
+
+    let buyer = Address::generate(&env);
+    token_asset.mint(&buyer, &5_000i128);
+    global_token.mint(&buyer, &5_000i128);
+
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    // Payment moved in the per-event token, not the contract-wide one.
+    assert_eq!(event_token.balance(&buyer), 3_000);
+    assert_eq!(global_token.balance(&buyer), 5_000);
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.owner, buyer);
+    assert_eq!(ticket.original_price, 2_000);
+}
+
+#[test]
+fn non_organizer_cannot_set_the_event_payment_token() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let impostor = Address::generate(&env);
+    let result = client.try_set_event_payment_token(&impostor, &1, &None);
+    assert_eq!(result, Err(Ok(Error::NotOrganizer)));
+}
+
+#[test]
+fn event_payment_token_cannot_change_after_tickets_are_issued() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &1_000i128,
+    );
+
+    let other_admin = Address::generate(&env);
+    let other_token = env.register_stellar_asset_contract_v2(other_admin);
+
+    let result = client.try_set_event_payment_token(&organizer, &1, &Some(other_token.address()));
+    assert_eq!(result, Err(Ok(Error::TicketsAlreadyIssued)));
+}
+
+#[test]
+fn event_payment_token_rejects_a_non_token_address() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let not_a_token = Address::generate(&env);
+    let result = client.try_set_event_payment_token(&organizer, &1, &Some(not_a_token));
+    assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
+}
+
+// ── Refund on revoke, funded by the organizer (issue #236) ──────────────────
+
+#[test]
+fn revoke_with_refund_returns_original_price_to_the_owner() {
+    let (env, client, token, token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Buyer bought the ticket on-chain; the organizer later refunds + revokes.
+    let buyer = Address::generate(&env);
+    token_asset.mint(&organizer, &10_000i128); // organizer's refund float
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let owner_before = token.balance(&buyer);
+    let organizer_before = token.balance(&organizer);
+
+    client.revoke_with_refund(&organizer, &ticket_id, &true);
+
+    // The organizer paid the original price back; the ticket is now revoked.
+    assert_eq!(token.balance(&buyer), owner_before + 2_000);
+    assert_eq!(token.balance(&organizer), organizer_before - 2_000);
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.status, TicketStatus::Revoked);
+
+    let transfer_result = client.try_transfer_ticket(&buyer, &ticket_id, &Address::generate(&env));
+    assert_eq!(transfer_result, Err(Ok(Error::Revoked)));
+}
+
+#[test]
+fn revoke_with_refund_false_behaves_like_revoke() {
+    let (env, client, token, token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let buyer = Address::generate(&env);
+    token_asset.mint(&organizer, &10_000i128);
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let owner_before = token.balance(&buyer);
+    let organizer_before = token.balance(&organizer);
+
+    client.revoke_with_refund(&organizer, &ticket_id, &false);
+
+    // No funds moved.
+    assert_eq!(token.balance(&buyer), owner_before);
+    assert_eq!(token.balance(&organizer), organizer_before);
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.status, TicketStatus::Revoked);
+}
+
+#[test]
+fn refund_settles_in_the_event_payment_token() {
+    let (env, client, global_token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Per-event override token (issue #235 integration).
+    let other_admin = Address::generate(&env);
+    let event_token_contract = env.register_stellar_asset_contract_v2(other_admin);
+    let event_token = TokenClient::new(&env, &event_token_contract.address());
+    let event_asset = StellarAssetClient::new(&env, &event_token_contract.address());
+
+    client.set_event_payment_token(&organizer, &1, &Some(event_token_contract.address()));
+
+    let buyer = Address::generate(&env);
+    event_asset.mint(&organizer, &10_000i128); // organizer funded in the event token
+    event_asset.mint(&buyer, &5_000i128);
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let buyer_before = event_token.balance(&buyer);
+    let organizer_before = event_token.balance(&organizer);
+
+    client.revoke_with_refund(&organizer, &ticket_id, &true);
+
+    // Refund arrived in the event's accepted token, not the global one.
+    assert_eq!(event_token.balance(&buyer), buyer_before + 2_000);
+    assert_eq!(event_token.balance(&organizer), organizer_before - 2_000);
+    let _ = global_token; // untouched
+}
+
+#[test]
+fn used_tickets_cannot_be_refunded_or_revoked() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+    client.check_in(&organizer, &ticket_id);
+
+    let result = client.try_revoke_with_refund(&organizer, &ticket_id, &true);
+    assert_eq!(result, Err(Ok(Error::AlreadyUsed)));
+}
+
+#[test]
+fn non_organizer_cannot_refund_revoke() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let impostor = Address::generate(&env);
+    let result = client.try_revoke_with_refund(&impostor, &ticket_id, &true);
+    assert_eq!(result, Err(Ok(Error::NotOrganizer)));
+}
