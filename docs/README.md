@@ -10,3 +10,4 @@
 - [INDUSTRIES.md](INDUSTRIES.md) — supported categories
 - [GLOSSARY.md](GLOSSARY.md) — terminology
 - [FAQ.md](FAQ.md) — frequently asked questions
+- [NATIVE_XLM.md](NATIVE_XLM.md) — native XLM payments via the Stellar Asset Contract

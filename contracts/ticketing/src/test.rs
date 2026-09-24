@@ -1558,3 +1558,149 @@ fn token_decimals_reject_an_invalid_token_on_propose() {
     let result = client.try_propose_payment_token(&admin, &not_a_token);
     assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
 }
+
+// ── Native XLM payments via the Stellar Asset Contract (issue #234) ─────────
+
+/// Registers the built-in Stellar Asset Contract for the NATIVE XLM asset in
+/// the test environment, mirroring how `Env::register_stellar_asset_contract_v2`
+/// deploys an asset-wrapped SAC, but with `Asset::Native` as the preimage.
+fn register_native_asset_contract(env: &Env) -> Address {
+    use std::rc::Rc;
+    let create = xdr::HostFunction::CreateContract(xdr::CreateContractArgs {
+        contract_id_preimage: xdr::ContractIdPreimage::Asset(xdr::Asset::Native),
+        executable: xdr::ContractExecutable::StellarAsset,
+    });
+    let token_id: Address = env
+        .host()
+        .invoke_function(create)
+        .unwrap()
+        .try_into_val(env)
+        .unwrap();
+    token_id
+}
+
+/// Creates an account ledger entry funded with `balance` lumens, so the
+/// native asset contract's transfers have a balance to draw from. Returns
+/// the SDK `Address` for the account.
+fn create_funded_xlm_account(env: &Env, key: [u8; 32], balance: i64) -> Address {
+    use std::rc::Rc;
+    let account_id = xdr::AccountId(xdr::PublicKey::PublicKeyTypeEd25519(xdr::Uint256(key)));
+    let ledger_key = Rc::new(xdr::LedgerKey::Account(xdr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    }));
+    let ledger_entry = Rc::new(xdr::LedgerEntry {
+        data: xdr::LedgerEntryData::Account(xdr::AccountEntry {
+            account_id: account_id.clone(),
+            balance,
+            flags: 0,
+            home_domain: Default::default(),
+            inflation_dest: None,
+            num_sub_entries: 0,
+            seq_num: xdr::SequenceNumber(0),
+            thresholds: xdr::Thresholds([1; 4]),
+            signers: xdr::VecM::default(),
+            ext: xdr::AccountEntryExt::V0,
+        }),
+        last_modified_ledger_seq: 0,
+        ext: xdr::LedgerEntryExt::V0,
+    });
+    env.host().add_ledger_entry(&ledger_key, &ledger_entry, None).unwrap();
+    xdr::ScAddress::Account(account_id).try_into_val(env).unwrap()
+}
+
+#[test]
+fn native_xlm_sac_is_accepted_as_payment_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // The native XLM Stellar Asset Contract is deterministic per network.
+    let native_sac = register_native_asset_contract(&env);
+    let admin = Address::generate(&env);
+    let organizer = create_funded_xlm_account(&env, [1u8; 32], 1_000_000_000);
+
+    let contract_id = env.register(TicketingContract, ());
+    let client = TicketingContractClient::new(&env, &contract_id);
+    // Initialize probes the native SAC's decimals() — an address that is not
+    // a token contract would be rejected here.
+    client.initialize(&admin, &native_sac);
+
+    // Issue #233's getter reports the native asset's 7 decimals.
+    assert_eq!(client.token_decimals(), 7);
+}
+
+#[test]
+fn native_xlm_primary_sale_moves_xlm_and_mints_the_ticket() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let native_sac = register_native_asset_contract(&env);
+    let native_token = TokenClient::new(&env, &native_sac);
+
+    let admin = Address::generate(&env);
+    // Organizer and buyer as funded on-chain accounts holding real XLM.
+    let organizer = create_funded_xlm_account(&env, [1u8; 32], 1_000_000_000);
+    let buyer = create_funded_xlm_account(&env, [2u8; 32], 5_000_000_000);
+
+    let contract_id = env.register(TicketingContract, ());
+    let client = TicketingContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &native_sac);
+    make_event(&env, &client, &organizer, 1);
+
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000_000_000i128, // 200 XLM
+    );
+
+    // Payment moved through the native asset contract.
+    assert_eq!(native_token.balance(&organizer), 3_000_000_000); // 100 XLM initial + 200 XLM ticket
+    assert_eq!(native_token.balance(&buyer), 3_000_000_000); // 500 XLM initial - 200 XLM ticket
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.owner, buyer);
+    assert_eq!(ticket.status, TicketStatus::Valid);
+    assert_eq!(ticket.original_price, 2_000_000_000);
+}
+
+#[test]
+fn native_xlm_resale_settles_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let native_sac = register_native_asset_contract(&env);
+    let native_token = TokenClient::new(&env, &native_sac);
+
+    let admin = Address::generate(&env);
+    let organizer = create_funded_xlm_account(&env, [1u8; 32], 1_000_000_000);
+    let seller = create_funded_xlm_account(&env, [2u8; 32], 5_000_000_000);
+    let buyer = create_funded_xlm_account(&env, [3u8; 32], 5_000_000_000);
+
+    let contract_id = env.register(TicketingContract, ());
+    let client = TicketingContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &native_sac);
+    make_event(&env, &client, &organizer, 1);
+
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &seller,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000_000_000i128, // 200 XLM face value
+    );
+
+    // Resale at face value (cap is 120%); 5% royalty to the organizer.
+    client.list_for_resale(&seller, &ticket_id, &2_000_000_000i128);
+    client.buy_resale(&buyer, &ticket_id);
+
+    // Royalty 5% of 2 XLM = 0.1 XLM; seller receives 1.9 XLM.
+    assert_eq!(native_token.balance(&organizer), 1_000_100_000); // 100.1 XLM
+    assert_eq!(native_token.balance(&seller), 4_900_000_000); // 490 XLM
+    assert_eq!(native_token.balance(&buyer), 3_000_000_000); // 300 XLM
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.owner, buyer);
+    assert_eq!(ticket.status, TicketStatus::Valid);
+}
