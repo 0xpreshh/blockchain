@@ -810,6 +810,38 @@ impl TicketingContract {
         Ok(())
     }
 
+    /// Revokes a ticket with an OPTIONAL refund to the current owner
+    /// (issue #236). When `refund` is true, the organizer pays the ticket's
+    /// `original_price` back to the owner in the event's accepted payment
+    /// token before the ticket is voided — the revocation remains
+    /// permanent afterwards. Without a refund, behavior matches
+    /// `revoke_ticket`. Revoking a used ticket is rejected either way.
+    pub fn revoke_with_refund(
+        env: Env,
+        organizer: Address,
+        ticket_id: u64,
+        refund: bool,
+    ) -> Result<(), Error> {
+        organizer.require_auth();
+        let mut ticket = Self::get_ticket(&env, ticket_id)?;
+        let event = Self::get_event(&env, ticket.event_id)?;
+        if event.organizer != organizer {
+            return Err(Error::NotOrganizer);
+        }
+        if ticket.status == TicketStatus::Used {
+            return Err(Error::AlreadyUsed);
+        }
+        if refund && ticket.original_price > 0 {
+            let token_client =
+                token::Client::new(&env, &Self::payment_token_for_event(&env, &event)?);
+            token_client.transfer(&organizer, &ticket.owner, &ticket.original_price);
+        }
+        ticket.status = TicketStatus::Revoked;
+        Self::remove_gift_claim(&env, ticket_id);
+        Self::save_ticket(&env, ticket_id, &ticket);
+        Ok(())
+    }
+
     /// Mass revocation of tickets by the event organizer (chargeback, policy violation).
     /// Bounded by `MAX_BATCH_SIZE`.
     pub fn revoke_batch(env: Env, organizer: Address, ticket_ids: Vec<u64>) -> Result<(), Error> {

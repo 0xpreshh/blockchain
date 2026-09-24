@@ -1810,3 +1810,138 @@ fn event_payment_token_rejects_a_non_token_address() {
     let result = client.try_set_event_payment_token(&organizer, &1, &Some(not_a_token));
     assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
 }
+
+// ── Refund on revoke, funded by the organizer (issue #236) ──────────────────
+
+#[test]
+fn revoke_with_refund_returns_original_price_to_the_owner() {
+    let (env, client, token, token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Buyer bought the ticket on-chain; the organizer later refunds + revokes.
+    let buyer = Address::generate(&env);
+    token_asset.mint(&organizer, &10_000i128); // organizer's refund float
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let owner_before = token.balance(&buyer);
+    let organizer_before = token.balance(&organizer);
+
+    client.revoke_with_refund(&organizer, &ticket_id, &true);
+
+    // The organizer paid the original price back; the ticket is now revoked.
+    assert_eq!(token.balance(&buyer), owner_before + 2_000);
+    assert_eq!(token.balance(&organizer), organizer_before - 2_000);
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.status, TicketStatus::Revoked);
+
+    let transfer_result = client.try_transfer_ticket(&buyer, &ticket_id, &Address::generate(&env));
+    assert_eq!(transfer_result, Err(Ok(Error::Revoked)));
+}
+
+#[test]
+fn revoke_with_refund_false_behaves_like_revoke() {
+    let (env, client, token, token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    let buyer = Address::generate(&env);
+    token_asset.mint(&organizer, &10_000i128);
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let owner_before = token.balance(&buyer);
+    let organizer_before = token.balance(&organizer);
+
+    client.revoke_with_refund(&organizer, &ticket_id, &false);
+
+    // No funds moved.
+    assert_eq!(token.balance(&buyer), owner_before);
+    assert_eq!(token.balance(&organizer), organizer_before);
+
+    let ticket = client.verify_ticket(&ticket_id);
+    assert_eq!(ticket.status, TicketStatus::Revoked);
+}
+
+#[test]
+fn refund_settles_in_the_event_payment_token() {
+    let (env, client, global_token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Per-event override token (issue #235 integration).
+    let other_admin = Address::generate(&env);
+    let event_token_contract = env.register_stellar_asset_contract_v2(other_admin);
+    let event_token = TokenClient::new(&env, &event_token_contract.address());
+    let event_asset = StellarAssetClient::new(&env, &event_token_contract.address());
+
+    client.set_event_payment_token(&organizer, &1, &Some(event_token_contract.address()));
+
+    let buyer = Address::generate(&env);
+    event_asset.mint(&organizer, &10_000i128); // organizer funded in the event token
+    event_asset.mint(&buyer, &5_000i128);
+    let ticket_id = client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let buyer_before = event_token.balance(&buyer);
+    let organizer_before = event_token.balance(&organizer);
+
+    client.revoke_with_refund(&organizer, &ticket_id, &true);
+
+    // Refund arrived in the event's accepted token, not the global one.
+    assert_eq!(event_token.balance(&buyer), buyer_before + 2_000);
+    assert_eq!(event_token.balance(&organizer), organizer_before - 2_000);
+    let _ = global_token; // untouched
+}
+
+#[test]
+fn used_tickets_cannot_be_refunded_or_revoked() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+    client.check_in(&organizer, &ticket_id);
+
+    let result = client.try_revoke_with_refund(&organizer, &ticket_id, &true);
+    assert_eq!(result, Err(Ok(Error::AlreadyUsed)));
+}
+
+#[test]
+fn non_organizer_cannot_refund_revoke() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let buyer = Address::generate(&env);
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &buyer,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "unassigned"),
+        &2_000i128,
+    );
+
+    let impostor = Address::generate(&env);
+    let result = client.try_revoke_with_refund(&impostor, &ticket_id, &true);
+    assert_eq!(result, Err(Ok(Error::NotOrganizer)));
+}
