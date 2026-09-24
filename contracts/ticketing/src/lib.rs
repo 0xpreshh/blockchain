@@ -1,7 +1,9 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    BytesN, Env, String, Vec,
 };
 
 #[contractevent]
@@ -44,6 +46,9 @@ pub struct Event {
     /// Basis points of every resale price paid to the organizer as royalty.
     pub royalty_bps: u32,
     pub tickets_issued: u64,
+    pub starts_at: u64,
+    pub transfer_freeze_seconds: u64,
+    pub resale_cutoff_seconds: u64,
     /// When true, primary sale proceeds are held by the contract instead of
     /// paid to the organizer immediately, and can only be released once the
     /// ledger sequence reaches `escrow_release_ledger`.
@@ -68,12 +73,21 @@ pub struct Ticket {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct GiftClaim {
+    pub from: Address,
+    pub secret_hash: BytesN<32>,
+    pub expires_at: u64,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
     PaymentToken,
     Event(u64),
     Ticket(u64),
+    GiftClaim(u64),
     NextTicketId,
     LastPurchaseLedger(Address),
     MinPurchaseSpacing,
@@ -101,6 +115,14 @@ pub enum Error {
     PurchaseTooSoon = 16,
     NotAdmin = 17,
     EventAlreadyStarted = 18,
+    InvalidEventTime = 19,
+    TransfersFrozen = 20,
+    ResaleClosed = 21,
+    InvalidLottery = 22,
+    GiftClaimNotFound = 23,
+    GiftClaimExpired = 24,
+    InvalidSecret = 25,
+    InvalidExpiry = 26,
 }
 
 const LEDGER_BUMP: u32 = 535_679; // ~31 days at 5s/ledger, matches other Soroban tooling defaults
@@ -140,10 +162,16 @@ impl TicketingContract {
         category: String,
         max_resale_multiplier_bps: u32,
         royalty_bps: u32,
+        starts_at: u64,
+        transfer_freeze_seconds: u64,
+        resale_cutoff_seconds: u64,
     ) -> Result<(), Error> {
         organizer.require_auth();
         if royalty_bps > 10_000 {
             return Err(Error::InvalidRoyalty);
+        }
+        if starts_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidEventTime);
         }
         let key = DataKey::Event(event_id);
         if env.storage().persistent().has(&key) {
@@ -156,6 +184,9 @@ impl TicketingContract {
             max_resale_multiplier_bps,
             royalty_bps,
             tickets_issued: 0,
+            starts_at,
+            transfer_freeze_seconds,
+            resale_cutoff_seconds,
             escrow_enabled: false,
             escrow_release_ledger: 0,
             escrow_balance: 0,
@@ -165,6 +196,56 @@ impl TicketingContract {
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
         Ok(())
+    }
+
+    /// Randomly allocates complimentary/reserved tickets across a supplied
+    /// entrant set. The organizer controls the entrant list; winner selection
+    /// is performed on-chain using Soroban's PRNG.
+    pub fn allocate_lottery(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        mut entrants: Vec<Address>,
+        winner_count: u32,
+        tier: String,
+        price: i128,
+    ) -> Result<Vec<u64>, Error> {
+        organizer.require_auth();
+        if price < 0 || winner_count == 0 || winner_count > entrants.len() {
+            return Err(Error::InvalidLottery);
+        }
+        for i in 0..entrants.len() {
+            for j in (i + 1)..entrants.len() {
+                if entrants.get(i) == entrants.get(j) {
+                    return Err(Error::InvalidLottery);
+                }
+            }
+        }
+        let mut event = Self::get_event(&env, event_id)?;
+        if event.organizer != organizer {
+            return Err(Error::NotOrganizer);
+        }
+
+        env.prng().shuffle(&mut entrants);
+        let mut ticket_ids = Vec::new(&env);
+        for i in 0..winner_count {
+            let winner = entrants.get(i).unwrap();
+            let ticket_id = Self::mint(
+                &env,
+                event_id,
+                winner,
+                tier.clone(),
+                String::from_str(&env, "unassigned"),
+                price,
+            );
+            ticket_ids.push_back(ticket_id);
+        }
+
+        event.tickets_issued += winner_count as u64;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Event(event_id), &event);
+        Ok(ticket_ids)
     }
 
     /// Opts an event into escrow: primary sale proceeds are held by the
@@ -323,9 +404,101 @@ impl TicketingContract {
             TicketStatus::Revoked => return Err(Error::Revoked),
             _ => {}
         }
+        let event = Self::get_event(&env, ticket.event_id)?;
+        if Self::transfer_frozen(&env, &event) {
+            return Err(Error::TransfersFrozen);
+        }
         ticket.owner = to;
         ticket.status = TicketStatus::Valid;
         ticket.resale_price = 0;
+        Self::remove_gift_claim(&env, ticket_id);
+        Self::save_ticket(&env, ticket_id, &ticket);
+        Ok(())
+    }
+
+    /// Creates a claim link without requiring the recipient address up front.
+    /// The owner shares the preimage off-chain; only its SHA-256 digest is stored.
+    pub fn create_gift_claim(
+        env: Env,
+        owner: Address,
+        ticket_id: u64,
+        secret_hash: BytesN<32>,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        if expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidExpiry);
+        }
+
+        let mut ticket = Self::get_ticket(&env, ticket_id)?;
+        if ticket.owner != owner {
+            return Err(Error::NotOwner);
+        }
+        match ticket.status {
+            TicketStatus::Used => return Err(Error::AlreadyUsed),
+            TicketStatus::Revoked => return Err(Error::Revoked),
+            _ => {}
+        }
+        if ticket.status == TicketStatus::Resale {
+            ticket.status = TicketStatus::Valid;
+            ticket.resale_price = 0;
+            Self::save_ticket(&env, ticket_id, &ticket);
+        }
+
+        let claim = GiftClaim {
+            from: owner,
+            secret_hash,
+            expires_at,
+        };
+        let key = DataKey::GiftClaim(ticket_id);
+        env.storage().persistent().set(&key, &claim);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(())
+    }
+
+    /// Claims a gifted ticket by presenting the secret preimage before expiry.
+    pub fn claim_gift(
+        env: Env,
+        recipient: Address,
+        ticket_id: u64,
+        secret: Bytes,
+    ) -> Result<(), Error> {
+        recipient.require_auth();
+        let key = DataKey::GiftClaim(ticket_id);
+        let claim: GiftClaim = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::GiftClaimNotFound)?;
+
+        if env.ledger().timestamp() >= claim.expires_at {
+            return Err(Error::GiftClaimExpired);
+        }
+        if env.crypto().sha256(&secret).to_bytes() != claim.secret_hash {
+            return Err(Error::InvalidSecret);
+        }
+
+        let mut ticket = Self::get_ticket(&env, ticket_id)?;
+        if ticket.owner != claim.from {
+            return Err(Error::NotOwner);
+        }
+        match ticket.status {
+            TicketStatus::Used => return Err(Error::AlreadyUsed),
+            TicketStatus::Revoked => return Err(Error::Revoked),
+            _ => {}
+        }
+
+        let event = Self::get_event(&env, ticket.event_id)?;
+        if Self::transfer_frozen(&env, &event) {
+            return Err(Error::TransfersFrozen);
+        }
+
+        ticket.owner = recipient;
+        ticket.status = TicketStatus::Valid;
+        ticket.resale_price = 0;
+        env.storage().persistent().remove(&key);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -353,6 +526,7 @@ impl TicketingContract {
             _ => {}
         }
         ticket.status = TicketStatus::Used;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         TicketCheckedIn {
             ticket_id,
@@ -373,6 +547,7 @@ impl TicketingContract {
             return Err(Error::NotOrganizer);
         }
         ticket.status = TicketStatus::Revoked;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -400,12 +575,16 @@ impl TicketingContract {
             _ => {}
         }
         let event = Self::get_event(&env, ticket.event_id)?;
+        if Self::resale_closed(&env, &event) {
+            return Err(Error::ResaleClosed);
+        }
         let cap = ticket.original_price * event.max_resale_multiplier_bps as i128 / 10_000;
         if price > cap {
             return Err(Error::ResalePriceExceedsCap);
         }
         ticket.status = TicketStatus::Resale;
         ticket.resale_price = price;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -435,6 +614,9 @@ impl TicketingContract {
             return Err(Error::NotForResale);
         }
         let event = Self::get_event(&env, ticket.event_id)?;
+        if Self::resale_closed(&env, &event) {
+            return Err(Error::ResaleClosed);
+        }
         let token_client = token::Client::new(&env, &Self::payment_token(&env)?);
         let royalty = ticket.resale_price * event.royalty_bps as i128 / 10_000;
         let seller_amount = ticket.resale_price - royalty;
@@ -447,6 +629,7 @@ impl TicketingContract {
         ticket.owner = buyer;
         ticket.status = TicketStatus::Valid;
         ticket.resale_price = 0;
+        Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
         Ok(())
     }
@@ -471,6 +654,23 @@ impl TicketingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+
+    fn remove_gift_claim(env: &Env, ticket_id: u64) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GiftClaim(ticket_id));
+    }
+
+    fn transfer_frozen(env: &Env, event: &Event) -> bool {
+        env.ledger().timestamp()
+            >= event
+                .starts_at
+                .saturating_sub(event.transfer_freeze_seconds)
+    }
+
+    fn resale_closed(env: &Env, event: &Event) -> bool {
+        env.ledger().timestamp() >= event.starts_at.saturating_sub(event.resale_cutoff_seconds)
     }
 
     fn enforce_purchase_throttle(env: &Env, buyer: &Address) -> Result<(), Error> {
