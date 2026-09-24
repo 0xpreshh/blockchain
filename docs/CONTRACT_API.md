@@ -14,6 +14,10 @@ this is a quick-reference summary.
 | `verify_ticket(ticket_id)` | anyone | Read-only lookup |
 | `check_in(organizer, ticket_id)` | organizer | Marks used, one-way |
 | `revoke_ticket(organizer, ticket_id)` | organizer | Permanently voids |
+| `revoke_with_refund(organizer, ticket_id, refund)` | organizer | Voids a ticket, optionally paying the original price back to the owner in the event's accepted payment token |
+| `set_event_payment_token(organizer, event_id, token)` | organizer | Sets/clears the event's accepted payment token (only before any tickets are issued) |
+| `event_payment_token(event_id)` | anyone | Resolves the event's payment token (per-event override or contract-wide token) |
+| `token_decimals()` | anyone | Decimals of the active payment token (cached at initialize / token change) |
 | `list_for_resale(owner, ticket_id, price)` | owner | Lists under the event's price cap |
 | `cancel_resale(owner, ticket_id)` | owner | Pulls a listing |
 | `buy_resale(buyer, ticket_id)` | buyer | Buys a listing, splits royalty |
