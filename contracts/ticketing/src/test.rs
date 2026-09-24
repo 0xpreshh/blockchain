@@ -1469,3 +1469,53 @@ fn transfer_batch_rejects_when_transfers_frozen() {
     let res = client.try_transfer_batch(&buyer1, &ids, &buyer2);
     assert_eq!(res, Err(Ok(Error::TransfersFrozen)));
 }
+
+#[test]
+fn initialize_rejects_an_address_that_is_not_a_token_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let not_a_token = env.register(TicketingContract, ());
+
+    let contract_id = env.register(TicketingContract, ());
+    let client = TicketingContractClient::new(&env, &contract_id);
+    let result = client.try_initialize(&admin, &not_a_token);
+    assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
+}
+
+#[test]
+fn admin_can_change_payment_token_after_the_timelock() {
+    let (env, client, _token, _token_asset, admin, _organizer) = setup();
+    let new_token = env.register_stellar_asset_contract_v2(Address::generate(&env));
+
+    client.propose_payment_token(&admin, &new_token.address());
+
+    let early = client.try_apply_payment_token(&admin);
+    assert_eq!(early, Err(Ok(Error::TimelockNotElapsed)));
+
+    env.ledger()
+        .with_mut(|l| l.sequence_number += PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS);
+    client.apply_payment_token(&admin);
+
+    let again = client.try_apply_payment_token(&admin);
+    assert_eq!(again, Err(Ok(Error::NoPendingPaymentToken)));
+}
+
+#[test]
+fn payment_token_change_requires_the_admin() {
+    let (env, client, _token, _token_asset, _admin, _organizer) = setup();
+    let stranger = Address::generate(&env);
+    let new_token = env.register_stellar_asset_contract_v2(Address::generate(&env));
+
+    let result = client.try_propose_payment_token(&stranger, &new_token.address());
+    assert_eq!(result, Err(Ok(Error::NotAdmin)));
+}
+
+#[test]
+fn proposing_a_non_token_payment_token_is_rejected() {
+    let (env, client, _token, _token_asset, admin, _organizer) = setup();
+    let not_a_token = Address::generate(&env);
+
+    let result = client.try_propose_payment_token(&admin, &not_a_token);
+    assert_eq!(result, Err(Ok(Error::InvalidPaymentToken)));
+}
